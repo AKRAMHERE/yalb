@@ -27,6 +27,7 @@ int main(int argc, char *argv[]) {
         if (argc >= 3) {
             global_rows = std::stoi(argv[1]);
             global_cols = std::stoi(argv[2]);
+            std::cout << "Using grid size: " << global_rows << "x" << global_cols << "\n";
         } else if (rank == 0) {
             std::cout << "Using default grid size: " << global_rows << "x" << global_cols << "\n";
             std::cout << "To specify grid size, run as: ./executable <rows> <cols>\n";
