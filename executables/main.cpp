@@ -24,6 +24,14 @@ int main(int argc, char *argv[]) {
         int global_rows = 129;
         int global_cols = 129;
 
+        if (argc >= 3) {
+            global_rows = std::stoi(argv[1]);
+            global_cols = std::stoi(argv[2]);
+        } else if (rank == 0) {
+            std::cout << "Using default grid size: " << global_rows << "x" << global_cols << "\n";
+            std::cout << "To specify grid size, run as: ./executable <rows> <cols>\n";
+        }
+
         int base_rows = global_rows / size; // Base number of rows for each process
         int local_rows = base_rows;
         int local_cols = global_cols; // All processes have the same number of columns
