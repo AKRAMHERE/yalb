@@ -4,6 +4,9 @@
 #include <filesystem>
 #include <mpi.h>
 #include <Kokkos_Core.hpp>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
 
 
 int main(int argc, char *argv[]) {
@@ -13,11 +16,29 @@ int main(int argc, char *argv[]) {
     Kokkos::initialize(argc, argv);
 
 
-    {
-        LBM lbm_grid = create_lbm(128, 128);
-        print_lbm_message();
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); // Get the rank of the current process
+    MPI_Comm_size(MPI_COMM_WORLD, &size); // Get the total number of processes
 
-        create_walls(lbm_grid);
+    {
+
+        int global_rows = 129;
+        int global_cols = 129;
+
+        int base_rows = global_rows / size; // Base number of rows for each process
+        int local_rows = base_rows;
+        int local_cols = global_cols; // All processes have the same number of columns
+
+        int remainder = global_rows % size; // Calculate the remainder rows
+
+        if (rank < remainder) {
+            local_rows += 1; // Distribute the remainder rows among the first 'remainder' processes
+        }
+
+        int local_start = (global_rows / size) * rank + std::min(rank, remainder); // Calculate the starting row for each process
+
+        LBM lbm_grid = create_lbm(local_rows + 2, local_cols); // +2 for ghost cells
+
+        create_walls(lbm_grid, local_start, global_rows);
 
         // initialize_density_bump(lbm_grid);
         // initialize_velocity_bump(lbm_grid);
@@ -25,43 +46,285 @@ int main(int argc, char *argv[]) {
         //initialize_shear_wave(lbm_grid);
         initialize_eq_conditions(lbm_grid);
 
-        for (int step = 0; step < 20000; ++step) {
-            compute_density(lbm_grid);
-            //Compute total mass and print every 10 steps
-            //if (step % 10 == 0)
-            //  printf("Total mass at step %d: %f\n", step, compute_total_mass(lbm_grid));
-            
-            compute_velocity(lbm_grid);
+        compute_density(lbm_grid);
 
-            // Confirm momentum conservation by checking the total momentum
-            //compare sum_i, cx[i], and f[i]
-            //printf("momentum before collision at step %d: %f\n", step, lbm_grid.v(lbm_grid.rows/2, lbm_grid.cols/2, 0) + lbm_grid.v(lbm_grid.rows/2, lbm_grid.cols/2, 1));
-            collision_step(lbm_grid);
-            //printf("momentum after collision at step %d: %f\n", step, lbm_grid.v(lbm_grid.rows/2, lbm_grid.cols/2, 0) + lbm_grid.v(lbm_grid.rows/2, lbm_grid.cols/2, 1));
+        double local_initial_mass =
+            compute_local_fluid_mass(lbm_grid);
 
-            
-            stream_lbm(lbm_grid);
-            move_top_wall(lbm_grid, 0.1);
-            
-            if (step % 1000 == 0){
-              write_output_rho(lbm_grid, "data/rho/output_rho_" + std::to_string(step) + ".txt");
-              write_output_velocity(lbm_grid, "data/v/output_velocity_" + std::to_string(step) + ".txt");
-            }
-            if (step % 100 == 0){
-              printf("done step: %d\n", step);
-            }
+        double initial_mass = 0.0;
+
+        MPI_Allreduce(
+            &local_initial_mass,
+            &initial_mass,
+            1,
+            MPI_DOUBLE,
+            MPI_SUM,
+            MPI_COMM_WORLD
+        );
+
+        if (rank == 0) {
+            std::cout
+                << "Initial fluid mass = "
+                << initial_mass
+                << '\n';
         }
 
+        auto get_global_mass = [&](LBM& grid) {
+            compute_density(grid);
+
+            const double local_mass =
+                compute_local_fluid_mass(grid);
+
+            double global_mass = 0.0;
+
+            MPI_Allreduce(
+                &local_mass,
+                &global_mass,
+                1,
+                MPI_DOUBLE,
+                MPI_SUM,
+                MPI_COMM_WORLD
+            );
+
+            return global_mass;
+        };
+
+        std::cout << "Rank " << rank << " owns " << local_rows << " rows\n";
+
+        Kokkos::View<double***> previous_velocity(
+            "previous_velocity",
+            lbm_grid.rows,
+            lbm_grid.cols,
+            2
+        );
+
+        bool have_previous_velocity = false;
+
+        const int residual_interval = 100;
+        const double residual_tolerance = 1.0e-8;
+        const int num_steps = 200000;
+
+        Kokkos::fence(); // Ensure all Kokkos operations are complete before starting the timer
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        double start_time = MPI_Wtime(); // Start the timer for the solver
+
+        int completed_steps = 0;
+
+        for (int step = 0; step < num_steps; ++step) {
+            
+            compute_density(lbm_grid);
+            compute_velocity(lbm_grid);
+            
+            collision_step(lbm_grid);
+
+            exchange_halos(
+                lbm_grid,
+                rank,
+                size
+            );
+
+            stream_lbm_pull(
+                lbm_grid,
+                0.1,
+                local_start,
+                global_rows
+            );
+
+            completed_steps++;
+
+            if ((step + 1) % residual_interval == 0) {
+                compute_density(lbm_grid);
+                compute_velocity(lbm_grid);
+
+                if (!have_previous_velocity) {
+                    Kokkos::deep_copy(
+                        previous_velocity,
+                        lbm_grid.v
+                    );
+
+                    have_previous_velocity = true;
+
+                    if (rank == 0) {
+                        std::cout
+                            << "Stored first velocity field at step "
+                            << step + 1
+                            << '\n';
+                    }
+                } else {
+                    auto velocity_host =
+                        Kokkos::create_mirror_view_and_copy(
+                            Kokkos::HostSpace(),
+                            lbm_grid.v
+                        );
+
+                    auto previous_velocity_host =
+                        Kokkos::create_mirror_view_and_copy(
+                            Kokkos::HostSpace(),
+                            previous_velocity
+                        );
+
+                    auto wall_host =
+                        Kokkos::create_mirror_view_and_copy(
+                            Kokkos::HostSpace(),
+                            lbm_grid.wall
+                        );
+
+                    double local_residual = 0.0;
+
+                    for (int row = 1;
+                        row < lbm_grid.rows - 1;
+                        ++row) {
+
+                        for (int col = 0;
+                            col < lbm_grid.cols;
+                            ++col) {
+
+                            if (wall_host(row, col)) {
+                                continue;
+                            }
+
+                            const double dv =
+                                velocity_host(row, col, 0) -
+                                previous_velocity_host(row, col, 0);
+
+                            const double du =
+                                velocity_host(row, col, 1) -
+                                previous_velocity_host(row, col, 1);
+
+                            const double velocity_change =
+                                std::sqrt(
+                                    du * du +
+                                    dv * dv
+                                );
+
+                            local_residual =
+                                std::max(
+                                    local_residual,
+                                    velocity_change
+                                );
+                        }
+                    }
+
+                    double global_residual = 0.0;
+
+                    MPI_Allreduce(
+                        &local_residual,
+                        &global_residual,
+                        1,
+                        MPI_DOUBLE,
+                        MPI_MAX,
+                        MPI_COMM_WORLD
+                    );
+
+                    if (rank == 0) {
+                        std::cout
+                            << std::setprecision(17)
+                            << "Step " << step + 1
+                            << ", residual = "
+                            << global_residual
+                            << '\n';
+                    }
+
+                    Kokkos::deep_copy(
+                        previous_velocity,
+                        lbm_grid.v
+                    );
+
+                    if (global_residual < residual_tolerance) {
+                        if (rank == 0) {
+                            std::cout
+                                << "Residual below tolerance at step "
+                                << step + 1
+                                << '\n';
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if ((step + 1) % 1000 == 0) {
+                const double global_mass = get_global_mass(lbm_grid);
+
+                const double absolute_drift = global_mass - initial_mass;
+
+                const double relative_drift = absolute_drift / initial_mass;
+
+                if (rank == 0){
+                    std::cout
+                        << std::setprecision(17)
+                        << "Step " << step + 1
+                        << ", mass = " << global_mass
+                        << ", absolute drift = " << absolute_drift
+                        << ", relative drift = " << relative_drift
+                        << '\n';
+                }
+
+                compute_velocity(lbm_grid);
+
+                write_output_rho(
+                    lbm_grid,
+                    "data/rho/output_rho_rank" +
+                        std::to_string(rank) +
+                        "_step" +
+                        std::to_string(step + 1) +
+                        ".txt",
+                    local_start
+                );
+
+                write_output_velocity(
+                    lbm_grid,
+                    "data/v/output_velocity_rank" +
+                        std::to_string(rank) +
+                        "_step" +
+                        std::to_string(step + 1) +
+                        ".txt",
+                    local_start
+                );
+
+            }
+        }
+        
+        Kokkos::fence(); // Ensure all Kokkos operations are complete before measuring time
+
+        double local_elapsed_time = MPI_Wtime() - start_time;
+
+        double elapsed_time = 0.0;
+
+        MPI_Reduce(
+            &local_elapsed_time,
+            &elapsed_time,
+            1,
+            MPI_DOUBLE,
+            MPI_MAX,
+            0,
+            MPI_COMM_WORLD
+        );
+
+        if (rank == 0) {
+
+            double total_lattice_Updates =
+                static_cast<double>(completed_steps) *
+                static_cast<double>(global_rows) *
+                static_cast<double>(global_cols);
+
+            double MLUPS =
+                total_lattice_Updates /
+                (elapsed_time * 1.0e6);
+
+            std::cout
+                << std::setprecision(17)
+                << "Total elapsed time = "
+                << elapsed_time
+                << " seconds\n"
+                << "Performance = "
+                << MLUPS
+                << " MLUPS\n";
+
+        }
+
+        
     }
-
-    // Retrieve process infos
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-    std::cout << "Hello I am rank " << rank << " of " << size << "\n";
-
-    if (rank == 0)
-      hello_world();
 
     auto input_path = "./simulation_test_input.txt";
 

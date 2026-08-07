@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include <numbers>
+#include <mpi.h>
 
 LBM create_lbm(int rows, int cols) {
     LBM grid;
@@ -10,7 +11,7 @@ LBM create_lbm(int rows, int cols) {
 
     grid.rho = Kokkos::View<double**>("rho", rows, cols);
 
-    grid.f = Kokkos::View<double***>(
+    grid.f = Kokkos::View<double***, Kokkos::LayoutRight>(
         "f",
         rows,
         cols,
@@ -33,107 +34,146 @@ LBM create_lbm(int rows, int cols) {
     return grid;
 }
 
+double compute_local_fluid_mass(const LBM& lbm)
+{
+    auto rho_host = Kokkos::create_mirror_view(lbm.rho);
+    auto wall_host = Kokkos::create_mirror_view(lbm.wall);
+
+    Kokkos::deep_copy(rho_host, lbm.rho);
+    Kokkos::deep_copy(wall_host, lbm.wall);
+
+    double local_mass = 0.0;
+
+    for (int row = 1; row < lbm.rows - 1; ++row) {
+        for (int col = 0; col < lbm.cols; ++col) {
+            if (!wall_host(row, col)) {
+                local_mass += rho_host(row, col);
+            }
+        }
+    }
+
+    return local_mass;
+}
+
 void print_lbm_message() {
     std::cout << "LBM initialized\n";
 }
 
-void create_walls(LBM& lbm) {
-
+void create_walls(LBM& lbm, int local_start, int global_rows) {
+    // Set walls on the left, right, and bottom boundaries of the grid
+    // Need to ensure that each rank sets its own walls correctly based on its local grid portion
     Kokkos::parallel_for(
-        "CreateWall",
+        "CreateWalls",
         Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {lbm.rows, lbm.cols}),
-        KOKKOS_LAMBDA(int x, int y) {
+        KOKKOS_LAMBDA(int row, int col) {
+            
+            const int global_row = local_start + row - 1;
 
-            if (x == 0 || x == lbm.rows - 1 || y == 0)
-                lbm.wall(x, y) = true;
-            else
-                lbm.wall(x, y) = false;
+            const bool ghost_row =
+                row == 0 || row == lbm.rows - 1;
 
-        }   
+            const bool bottom_wall = 
+                global_row == 0;
+
+            const bool top_wall =
+                global_row == global_rows - 1;
+
+            const bool left_wall = 
+                col == 0;
+
+            const bool right_wall =
+                col == lbm.cols - 1;
+            
+            if (ghost_row) {
+                /*
+                    Ghost rows represent neighboring rows, but their
+                    first and last columns are still side walls.
+                */
+               lbm.wall(row, col) = 
+                    left_wall || right_wall;
+            } else {
+                lbm.wall(row, col) =
+                    bottom_wall ||
+                    top_wall ||
+                    left_wall ||
+                    right_wall;
+            }
+        }
     );
 
 }
 
-void move_top_wall(LBM& lbm, double u_lid) {
+void move_top_wall(LBM& lbm, double u_lid, int local_start, int global_rows) {
 
-    int y = lbm.cols - 1; // top boundary row
+    // int y = lbm.cols - 1; // top boundary row
 
+    const int top_fluid_global_x = global_rows - 2; // The last fluid row in the global grid (just below the top wall)
+    const int local_x = top_fluid_global_x - local_start + 1; // Convert to local index, +1 for ghost cell offset   
+
+
+    if (local_x < 1 || local_x >= lbm.rows - 1) {
+        // This rank does not own the top fluid row, so return early
+        return;
+    }
 
     // loop over every position on along the lid
     Kokkos::parallel_for(
         "MoveTopWall",
-        lbm.rows,
-        KOKKOS_LAMBDA(int x) {
+        Kokkos::RangePolicy<>(1, lbm.rows - 1), // Exclude ghost cells
+        KOKKOS_LAMBDA(int y) {
 
             /*
-                Reconstruct density at the top boundary.
+                Coordinate convention in this code:
+                    first array index, x: vertical direction
+                    second array index, y: horizontal direction
 
-                At the top wall, some populations are known after streaming
-                and some are missing. This formula estimates rho from the
-                populations available at the boundary.
+                D2Q9 directions crossing the top wall have cx = +1:
 
-                The factor 2 appears because the unknown opposite-direction
-                populations are paired with the known populations.
+                    i = 1: (+1,  0)
+                    i = 5: (+1, +1)
+                    i = 8: (+1, -1)
+
+                stream_lbm() has already reflected these into:
+
+                    1 -> 3
+                    5 -> 7
+                    8 -> 6
+
+                The lid moves in the positive second-index direction,
+                so the reflected diagonal populations require the
+                standard moving-wall correction.
+            */
+            
+            double rho = 0.0;
+
+            for (int i = 0; i < 9; ++i) {
+                rho += lbm.f(local_x, y, i);
+            }
+
+            const double correction = rho * u_lid / 6.0;
+
+            /*
+                Population 5 had positive horizontal velocity before
+                hitting the wall. Its reflected population is 7.
             */
 
-            double rho =
-                lbm.f(x, y, 0) +
-                lbm.f(x, y, 1) +
-                lbm.f(x, y, 3) +
-                2.0 * (
-                    lbm.f(x, y, 2) +
-                    lbm.f(x, y, 5) +
-                    lbm.f(x, y, 6)
-                );
-        /*
-                Vertical bounce-back part.
+            lbm.f(local_x, y, 7) -= correction;
 
-                f2 points upward toward the lid.
-                f4 points downward back into the fluid.
-
-                For the straight vertical direction, the moving lid does not
-                add horizontal correction, so we simply reflect:
-                    f4 = f2
-        */        
-        lbm.f(x, y, 4) = lbm.f(x, y, 2);
-
-        /*
-                Diagonal bounce back with moving wall correction.
-
-                f5 points northeast.
-                Its opposite direction is f7, southwest.
-
-                Because the lid moves to the right, the reflected diagonal
-                populations are adjusted so the fluid receives positive
-                x-momentum from the lid.
-
-                This term:
-                    (1/6) * rho * u_lid
-
-                is the D2Q9 moving-wall correction for the diagonal directions.
-        */
-        lbm.f(x, y, 7) = lbm.f (x, y, 5) - (1.0/6.0) * rho * u_lid;
-        
-        /*
-                f6 points northwest.
-                Its opposite direction is f8, southeast.
-
-                This gets the opposite sign from f7 because f8 has positive
-                x-direction while f7 has negative x-direction.
-        */
-        lbm.f(x, y, 8) = lbm.f (x, y, 6) + (1.0/6.0) * rho * u_lid;
-
-
+            /*
+                Population 8 had negative horizontal velocity before
+                hitting the wall. Its reflected population is 6.
+            */
+            lbm.f(local_x, y, 6) += correction;
 
         }
     );
 
 }
 
-void stream_lbm(LBM& lbm) {
+void stream_lbm(LBM& lbm, double u_lid, int local_start, int global_rows) {
 
 
-    Kokkos::View<double***> f_next("f_next", lbm.rows, lbm.cols, 9);
+    Kokkos::View<double***, Kokkos::LayoutRight> f_next("f_next", lbm.rows, lbm.cols, 9);
     
     /*
         Initialize f_next to zero.
@@ -145,10 +185,10 @@ void stream_lbm(LBM& lbm) {
 
     Kokkos::parallel_for(
         "StreamLBM",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
-        KOKKOS_LAMBDA(int x, int y, int i) {
-            int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1}; // Example velocity directions
-            int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
+        KOKKOS_LAMBDA(int row, int col, int i) {
+            int drow[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1}; // Example velocity directions
+            int dcol[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
 
             int opposite[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
 
@@ -159,13 +199,13 @@ void stream_lbm(LBM& lbm) {
                 We do not stream populations out of solid wall cells.
                 Only fluid cells participate in collision/streaming.
             */
-            if (lbm.wall(x, y)) {
+            if (lbm.wall(row, col)) {
                 return;
             }
 
             
-            int x_next = x + cx[i];
-            int y_next = y + cy[i];
+            const int next_row = row + drow[i];
+            const int next_col = col + dcol[i];
 
 
             /*
@@ -177,8 +217,8 @@ void stream_lbm(LBM& lbm) {
                 So x_next == 300 is outside.
                 y_next == 300 is outside.
             */
-            bool outside = x_next < 0 || x_next >= lbm.rows ||
-                           y_next < 0 || y_next >= lbm.cols;
+            bool outside = next_row < 0 || next_row >= lbm.rows ||
+                           next_col < 0 || next_col >= lbm.cols;
             
 
             /*
@@ -197,31 +237,180 @@ void stream_lbm(LBM& lbm) {
                     stay at the current fluid node,
                     but reverse direction.
             */
-            if (outside || lbm.wall(x_next, y_next)) {
-                f_next(x, y, opposite[i]) = lbm.f(x, y, i);
+            if (outside) {
+                f_next(row, col, opposite[i]) = lbm.f(row, col, i);
+                return;
             }
 
-             /*
-                Case 2:
-                The destination is a normal fluid node.
+            if (lbm.wall(next_row, next_col)) {
+                /*
+                    Convert the destinations local vertical index
+                    to a global vertical index
 
-                Then stream normally:
-                    f_i(x,y) moves to f_i(x_next,y_next)
-            */
-            else {
-                f_next(x_next, y_next, i) = lbm.f(x, y, i);
+                    Local fluid index 1 corresponds to global row
+                    local_start
+                */
+                const int destination_global_x = local_start + (next_row - 1); // Convert to global index, -1 for ghost cell offset
+                /*
+                    The top boundary is global_rows - 1
+
+                    Exclude the two corner nodes because the moving lid
+                    normally does not include the stationary side-wall corners
+                */
+                const bool hits_moving_lid =
+                    destination_global_x == global_rows - 1 &&
+                    next_col > 0 &&
+                    next_col < lbm.cols - 1;
+
+                if (hits_moving_lid) {
+                   /*
+                        Moving wall bounce back:
+
+                        f_opposite =
+                            f_incoming - 6 * w_i * rho (c_i dot u_wall)
+
+                        for diagonal D2Q9 populations, w_i = 1/36, and c_i dot u_wall = +/- u_lid
+
+                        so 6 * w_i = 1/6
+
+                        The lid velocity is in the positive horizontal, second-index direction:
+
+                        u_wall = (0, u_lid)
+                   
+                   */ 
+                    const double rho = lbm.rho(row, col);
+
+                    const double wall_correction = 
+                        6.0 *
+                        (1.0 / 36.0) *
+                        rho *
+                        dcol[i] *
+                        u_lid;
+                    
+                    f_next(row, col, opposite[i]) = lbm.f(row, col, i) - wall_correction;
+
+                } else {
+                    // ordinary stationary-wall bounce back
+                    f_next(row, col, opposite[i]) = lbm.f(row, col, i);
+                }
+
+                return;
             }
+            f_next(next_row, next_col, i) = lbm.f(row, col, i);                  
         }
     );
 
     lbm.f = f_next; // Update the distribution functions after streaming
 }
 
+
+void stream_lbm_pull(LBM& lbm, double u_lid, int local_start, int global_rows) {
+
+    // std::cout << "u_lid = " << u_lid << '\n';
+
+    Kokkos::View<double***, Kokkos::LayoutRight> f_next("f_next", lbm.rows, lbm.cols, 9);
+    
+    /*
+        Initialize f_next to zero.
+
+        This matters because not every f_next entry is necessarily written
+        during every streaming step, especially near walls.
+    */
+    Kokkos::deep_copy(f_next, 0.0);
+
+    Kokkos::parallel_for(
+        "StreamLBM",
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
+        KOKKOS_LAMBDA(int row, int col, int i) {
+            int drow[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1}; // Example velocity directions
+            int dcol[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+
+            int opposite[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+
+            const double weights[9] = {
+                4.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0
+            };
+
+            
+            /*
+                Do not update physical wall nodes as fluid destinations
+            */
+            if (lbm.wall(row, col)){
+                return;
+            }
+
+            /*
+                Pull population i from the source cell
+
+                Push:
+                    destination = source + c_i
+
+                Pull:
+                    source = destination - c_i
+            */
+            const int source_row = row - drow[i];
+            const int source_col = col - dcol[i];
+
+            const bool source_outside =
+                source_row < 0 ||
+                source_row >= lbm.rows ||
+                source_col < 0 ||
+                source_col >= lbm.cols;
+
+            if (source_outside) {
+                f_next(row, col, i) = lbm.f(row, col, opposite[i]);
+                return;
+            }
+
+            /*
+                If the source is a physical wall, reconstruct the incoming
+                population using bounce back
+            */
+           if (lbm.wall(source_row, source_col)) {
+                const int source_global_row = local_start + source_row - 1;
+
+                const bool hits_moving_lid =
+                    source_global_row == global_rows - 1 &&
+                    col > 0 &&
+                    col < lbm.cols - 1;
+
+                if (hits_moving_lid) {
+                    const double rho = lbm.rho(row, col);
+                    
+                    const double wall_correction =
+                        6.0 *
+                        weights[i] *
+                        rho *
+                        dcol[i] *
+                        u_lid;
+
+                    f_next(row, col, i) = lbm.f(row, col, opposite[i]) + wall_correction;
+                } else {
+                    f_next(row, col, i) = lbm.f(row, col, opposite[i]);
+                }
+            return;
+           }
+           f_next(row, col, i) = lbm.f(source_row, source_col, i);
+        }
+    );
+
+    lbm.f = f_next; // Update the distribution functions after streaming
+}
+
+
 void compute_density(LBM& lbm) {
     // Example computation: compute density from distribution functions
     Kokkos::parallel_for(
         "ComputeDensity",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {lbm.rows, lbm.cols}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({1, 0}, {lbm.rows - 1, lbm.cols}),
         KOKKOS_LAMBDA(int x, int y) {
             double local_rho = 0.0;
             for (int i = 0; i < 9; ++i) {
@@ -236,29 +425,29 @@ void compute_velocity(LBM& lbm) {
     // Example computation: compute velocity from distribution functions
     Kokkos::parallel_for(
         "ComputeVelocity",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {lbm.rows, lbm.cols}),
-        KOKKOS_LAMBDA(int x, int y) {
-            double local_vx = 0.0;
-            double local_vy = 0.0;
-            int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1}; // Example velocity directions
-            int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({1, 0}, {lbm.rows - 1, lbm.cols}),
+        KOKKOS_LAMBDA(int row, int col) {
+            double velocity_vertical = 0.0;
+            double velocity_horizontal = 0.0;
+            int drow[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1}; // Example velocity directions
+            int dcol[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
             for (int i = 0; i < 9; ++i) {
-                local_vx += lbm.f(x, y, i) * cx[i];
-                local_vy += lbm.f(x, y, i) * cy[i];
+                velocity_vertical += lbm.f(row, col, i) * drow[i];
+                velocity_horizontal += lbm.f(row, col, i) * dcol[i];
             }
-            if (lbm.rho(x, y) > 0) { // Avoid division by zero
-                lbm.v(x, y, 0) = local_vx / lbm.rho(x, y);
-                lbm.v(x, y, 1) = local_vy / lbm.rho(x, y);
+            if (lbm.rho(row, col) > 0) { // Avoid division by zero
+                lbm.v(row, col, 0) = velocity_vertical / lbm.rho(row, col);
+                lbm.v(row, col, 1) = velocity_horizontal / lbm.rho(row, col);
             } else {
-                lbm.v(x, y, 0) = 0.0;
-                lbm.v(x, y, 1) = 0.0;
+                lbm.v(row, col, 0) = 0.0;
+                lbm.v(row, col, 1) = 0.0;
             }
         }
     );
 }
 
 void write_output_f(const LBM& lbm, const std::string& filename) {
-    Kokkos::View<double***>::HostMirror f_host = Kokkos::create_mirror_view(lbm.f);
+    Kokkos::View<double***, Kokkos::LayoutRight>::HostMirror f_host = Kokkos::create_mirror_view(lbm.f);
     Kokkos::deep_copy(f_host, lbm.f);
 
     std::ofstream output_file(filename);
@@ -279,15 +468,16 @@ void write_output_f(const LBM& lbm, const std::string& filename) {
     output_file.close();
 }
 
-void write_output_rho(const LBM& lbm, const std::string& filename) {
+void write_output_rho(const LBM& lbm, const std::string& filename, int local_start) {
     Kokkos::View<double**>::HostMirror rho_host = Kokkos::create_mirror_view(lbm.rho);
     Kokkos::deep_copy(rho_host, lbm.rho);
 
     std::ofstream output_file(filename);
 
-    for (int x = 0; x < lbm.rows; ++x) {
+    for (int x = 1; x < lbm.rows - 1; ++x) {
+        int global_x = local_start + (x - 1); // Calculate the global x-coordinate based on the local start index
         for (int y = 0; y < lbm.cols; ++y) {
-            output_file << x << " "
+            output_file << global_x << " "
                         << y << " "
                         << rho_host(x, y) << "\n";
         }
@@ -296,18 +486,25 @@ void write_output_rho(const LBM& lbm, const std::string& filename) {
     output_file.close();
 }
 
-void write_output_velocity(const LBM& lbm, const std::string& filename) {
-    Kokkos::View<double***>::HostMirror v_host = Kokkos::create_mirror_view(lbm.v);
+void write_output_velocity(const LBM& lbm, const std::string& filename, int local_start) {
+    auto v_host = Kokkos::create_mirror_view(lbm.v);
     Kokkos::deep_copy(v_host, lbm.v);
 
     std::ofstream output_file(filename);
 
-    for (int x = 0; x < lbm.rows; ++x) {
-        for (int y = 0; y < lbm.cols; ++y) {
-            output_file << x << " "
-                        << y << " "
-                        << v_host(x, y, 0) << " "
-                        << v_host(x, y, 1) << "\n";
+    for (int row = 1; row < lbm.rows - 1; ++row) {
+        const int global_row = local_start + (row - 1); // Calculate the global x-coordinate based on the local start index
+        
+        for (int col = 0; col < lbm.cols; ++col) {
+            
+            const double vertical_velocity = v_host(row, col, 0);
+
+            const double horizontal_velocity = v_host(row, col, 1);
+
+            output_file << global_row << " "
+                        << col << " "
+                        << horizontal_velocity << " "
+                        << vertical_velocity << "\n";
         }
         output_file << "\n";
     }
@@ -315,7 +512,7 @@ void write_output_velocity(const LBM& lbm, const std::string& filename) {
 }
 
 Kokkos::View<double***> compute_equilibrium(LBM& lbm) {
-    Kokkos::View<double***> feq("feq", lbm.rows, lbm.cols, 9);
+    Kokkos::View<double***, Kokkos::LayoutRight> feq("feq", lbm.rows, lbm.cols, 9);
 
     double w[9] = {
         4.0/9.0,
@@ -334,7 +531,7 @@ Kokkos::View<double***> compute_equilibrium(LBM& lbm) {
 
     Kokkos::parallel_for(
         "ComputeEquilibrium",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {lbm.rows, lbm.cols}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({1, 0}, {lbm.rows - 1, lbm.cols}),
         KOKKOS_LAMBDA(int x, int y) {
             double rho = lbm.rho(x, y);
             double vx = lbm.v(x, y, 0);
@@ -353,13 +550,18 @@ Kokkos::View<double***> compute_equilibrium(LBM& lbm) {
 }
 
 void collision_step(LBM& lbm) {
-    double tau = 0.6; // Relaxation time
+    double tau = 0.596; // Relaxation time
     auto feq = compute_equilibrium(lbm);
 
     Kokkos::parallel_for(
         "CollisionStep",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
         KOKKOS_LAMBDA(int x, int y, int i) {
+
+            if (lbm.wall(x, y)) {
+                return;
+            }
+
             lbm.f(x, y, i) += -(lbm.f(x, y, i) - feq(x, y, i)) / tau;
         }
     );
@@ -399,7 +601,7 @@ void initialize_density_bump(LBM& lbm) {
 
     Kokkos::parallel_for(
         "InitializeDistributionFunctions",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
         KOKKOS_LAMBDA(int x, int y, int i) {
             lbm.f(x, y, i) = feq(x, y, i);
         }
@@ -411,9 +613,9 @@ void initialize_density_bump(LBM& lbm) {
 double compute_total_mass(const LBM& lbm) {
     auto rho_host = Kokkos::create_mirror_view(lbm.rho);
     Kokkos::deep_copy(rho_host, lbm.rho);
-
+    
     double mass = 0.0;
-    for (int x = 0; x < lbm.rows; ++x) {
+    for (int x = 1; x < lbm.rows - 1; ++x) {
         for (int y = 0; y < lbm.cols; ++y) {
             mass += rho_host(x, y);
         }
@@ -441,7 +643,7 @@ void initialize_velocity_bump(LBM& lbm){
 
         Kokkos::parallel_for(
             "InitializeDistributionFunctions",
-            Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
+            Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
             KOKKOS_LAMBDA(int x, int y, int i) {
                 lbm.f(x, y, i) = feq(x, y, i);
             }
@@ -466,7 +668,7 @@ void initialize_fixed_point(LBM& lbm){
 
     Kokkos::parallel_for(
         "InitializeDistributionFunctions",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
         KOKKOS_LAMBDA(int x, int y, int i) {
             lbm.f(x, y, i) = feq(x, y, i);
         }
@@ -481,7 +683,7 @@ void initialize_eq_conditions(LBM& lbm){
     // f = feq(rho, v) everywhere
     Kokkos::parallel_for(
         "InitializeFixedPoint",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {lbm.rows, lbm.cols}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({1, 0}, {lbm.rows - 1, lbm.cols}),
         KOKKOS_LAMBDA(int x, int y) {
             lbm.rho(x, y) = 1.0; // uniform density
             lbm.v(x, y, 0) = 0.0; // vx
@@ -493,7 +695,7 @@ void initialize_eq_conditions(LBM& lbm){
 
     Kokkos::parallel_for(
         "InitializeDistributionFunctions",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
         KOKKOS_LAMBDA(int x, int y, int i) {
             lbm.f(x, y, i) = feq(x, y, i);
         }
@@ -535,11 +737,137 @@ void initialize_shear_wave(LBM &lbm) {
 
     Kokkos::parallel_for(
         "InitializeDistributionFunctions",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0, 0, 0}, {lbm.rows, lbm.cols, 9}),
+        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
         KOKKOS_LAMBDA(int x, int y, int i) {
             lbm.f(x, y, i) = feq(x, y, i);
         }
     );
 
 
+}
+
+
+
+void exchange_halos(LBM& lbm, int rank, int size) {
+    
+    const int lower_rank =
+        (rank == 0)
+            ? MPI_PROC_NULL
+            : rank - 1;
+
+    const int upper_rank =
+        (rank == size - 1)
+            ? MPI_PROC_NULL
+            : rank + 1;
+
+    const int values_per_row =
+        lbm.cols * 9;
+
+    auto f_host =
+        Kokkos::create_mirror_view_and_copy(
+            Kokkos::HostSpace(),
+            lbm.f
+        );
+
+    std::vector<double> send_lower(values_per_row);
+    std::vector<double> send_upper(values_per_row);
+    std::vector<double> receive_lower(values_per_row);
+    std::vector<double> receive_upper(values_per_row);
+
+    /*
+        Pack the first and last owned rows.
+
+        Owned rows:
+            1 ... lbm.rows - 2
+
+        Ghost rows:
+            0
+            lbm.rows - 1
+    */
+    for (int col = 0; col < lbm.cols; ++col) {
+        for (int i = 0; i < 9; ++i) {
+            const int index =
+                col * 9 + i;
+
+            send_lower[index] =
+                f_host(1, col, i);
+
+            send_upper[index] =
+                f_host(lbm.rows - 2, col, i);
+        }
+    }
+
+    /*
+        Send the lower owned row to the lower rank and receive
+        the upper rank's lower owned row into our upper ghost.
+    */
+    MPI_Sendrecv(
+        send_lower.data(),
+        values_per_row,
+        MPI_DOUBLE,
+        lower_rank,
+        100,
+
+        receive_upper.data(),
+        values_per_row,
+        MPI_DOUBLE,
+        upper_rank,
+        100,
+
+        MPI_COMM_WORLD,
+        MPI_STATUS_IGNORE
+    );
+
+    /*
+        Send the upper owned row to the upper rank and receive
+        the lower rank's upper owned row into our lower ghost.
+    */
+    MPI_Sendrecv(
+        send_upper.data(),
+        values_per_row,
+        MPI_DOUBLE,
+        upper_rank,
+        200,
+
+        receive_lower.data(),
+        values_per_row,
+        MPI_DOUBLE,
+        lower_rank,
+        200,
+
+        MPI_COMM_WORLD,
+        MPI_STATUS_IGNORE
+    );
+
+    if (lower_rank != MPI_PROC_NULL) {
+        for (int col = 0; col < lbm.cols; ++col) {
+            for (int i = 0; i < 9; ++i) {
+                const int index =
+                    col * 9 + i;
+
+                f_host(0, col, i) =
+                    receive_lower[index];
+            }
+        }
+    }
+
+    if (upper_rank != MPI_PROC_NULL) {
+        for (int col = 0; col < lbm.cols; ++col) {
+            for (int i = 0; i < 9; ++i) {
+                const int index =
+                    col * 9 + i;
+
+                f_host(
+                    lbm.rows - 1,
+                    col,
+                    i
+                ) = receive_upper[index];
+            }
+        }
+    }
+
+    Kokkos::deep_copy(
+        lbm.f,
+        f_host
+    );
 }
