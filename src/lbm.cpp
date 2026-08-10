@@ -511,7 +511,7 @@ void write_output_velocity(const LBM& lbm, const std::string& filename, int loca
     output_file.close();
 }
 
-Kokkos::View<double***> compute_equilibrium(LBM& lbm) {
+Kokkos::View<double***, Kokkos::LayoutRight> compute_equilibrium(LBM& lbm) {
     Kokkos::View<double***, Kokkos::LayoutRight> feq("feq", lbm.rows, lbm.cols, 9);
 
     double w[9] = {

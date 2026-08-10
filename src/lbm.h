@@ -23,7 +23,7 @@ void compute_velocity(LBM& lbm);
 void write_output_f(const LBM& lbm, const std::string& filename);
 void write_output_rho(const LBM& lbm, const std::string& filename, int local_start);
 void write_output_velocity(const LBM& lbm, const std::string& filename, int local_start);
-Kokkos::View<double***> compute_equilibrium(LBM& lbm);
+Kokkos::View<double***, Kokkos::LayoutRight> compute_equilibrium(LBM& lbm);
 void collision_step(LBM& lbm);
 void initialize_density_bump(LBM& lbm);
 double compute_total_mass(const LBM& lbm);
