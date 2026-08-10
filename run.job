@@ -1,0 +1,15 @@
+#!/bin/bash -x
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --time=00:40:00
+#SBATCH -J lbm
+#SBATCH --mem=6gb
+#SBATCH --partition=cpu
+
+module purge
+module load compiler/gnu mpi/openmpi
+module list
+
+echo "Running on ${SLURM_JOB_NUM_NODES} nodes with ${SLURM_NTASKS} MPI tasks."
+
+time mpirun --bind-to none ./build/executables/main
