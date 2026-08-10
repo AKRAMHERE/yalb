@@ -1,15 +1,16 @@
-#!/bin/bash -x
+#!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks=1
 #SBATCH --time=00:40:00
-#SBATCH -J lbm
+#SBATCH -J lbm_gpu
 #SBATCH --mem=6gb
-#SBATCH --partition=cpu
+#SBATCH --partition=gpu_a100_il
+#SBATCH --gres=gpu:1
 
 module purge
-module load compiler/gnu mpi/openmpi
-module list
+module load toolkit/nvidia-hpc-sdk/25.1
+module load mpi/openmpi/5.0-nvidia-25.1-nompi
 
-echo "Running on ${SLURM_JOB_NUM_NODES} nodes with ${SLURM_NTASKS} MPI tasks."
+nvidia-smi
 
-time mpirun --bind-to none ./build/executables/main
+time ./build-gpu/executables/main 300 300

@@ -1,0 +1,1 @@
+include(/home/fr/fr_fr/fr_th437/yalb/build-gpu/_deps/kokkos-build/KokkosTargets.cmake)
