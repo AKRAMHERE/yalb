@@ -5,12 +5,18 @@
 struct LBM {
     Kokkos::View<double**> rho;
     Kokkos::View<double***, Kokkos::LayoutRight> f;
+    Kokkos::View<double***, Kokkos::LayoutRight> f_next;
     Kokkos::View<double***> v;
 
     Kokkos::View<bool**> wall;
 
     int rows;
     int cols;
+
+    Kokkos::View<double*> send_lower;
+    Kokkos::View<double*> send_upper;
+    Kokkos::View<double*> recv_lower;
+    Kokkos::View<double*> recv_upper;
 
   // LBM(int rows, int cols) : rho("rho", rows, cols), f("f", rows, cols, 9), v("v", rows, cols) {}
 };

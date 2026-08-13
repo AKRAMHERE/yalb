@@ -120,10 +120,12 @@ int main(int argc, char *argv[]) {
 
         int completed_steps = 0;
 
+        constexpr bool diagnostics = false;
+
         for (int step = 0; step < num_steps; ++step) {
             
-            compute_density(lbm_grid);
-            compute_velocity(lbm_grid);
+            // compute_density(lbm_grid);
+            // compute_velocity(lbm_grid);
             
             collision_step(lbm_grid);
 
@@ -142,7 +144,7 @@ int main(int argc, char *argv[]) {
 
             completed_steps++;
 
-            if ((step + 1) % residual_interval == 0) {
+            if (diagnostics && (step + 1) % residual_interval == 0) {
                 compute_density(lbm_grid);
                 compute_velocity(lbm_grid);
 
@@ -181,40 +183,38 @@ int main(int argc, char *argv[]) {
 
                     double local_residual = 0.0;
 
-                    for (int row = 1;
-                        row < lbm_grid.rows - 1;
-                        ++row) {
+                    Kokkos::parallel_reduce(
+                        "VelocityResidual",
+                        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                            {1, 0},
+                            {lbm_grid.rows - 1, lbm_grid.cols}
+                        ),
+                        KOKKOS_LAMBDA(
+                            int row,
+                            int col,
+                            double& max_value
+                        ) {
+                            if (!lbm_grid.wall(row, col)) {
 
-                        for (int col = 0;
-                            col < lbm_grid.cols;
-                            ++col) {
+                                const double dv =
+                                    lbm_grid.v(row, col, 0) -
+                                    previous_velocity(row, col, 0);
 
-                            if (wall_host(row, col)) {
-                                continue;
+                                const double du =
+                                    lbm_grid.v(row, col, 1) -
+                                    previous_velocity(row, col, 1);
+
+                                const double value =
+                                    sqrt(du * du + dv * dv);
+
+                                if (value > max_value) {
+                                    max_value = value;
+                                }
                             }
-
-                            const double dv =
-                                velocity_host(row, col, 0) -
-                                previous_velocity_host(row, col, 0);
-
-                            const double du =
-                                velocity_host(row, col, 1) -
-                                previous_velocity_host(row, col, 1);
-
-                            const double velocity_change =
-                                std::sqrt(
-                                    du * du +
-                                    dv * dv
-                                );
-
-                            local_residual =
-                                std::max(
-                                    local_residual,
-                                    velocity_change
-                                );
-                        }
-                    }
-
+                        },
+                        Kokkos::Max<double>(local_residual)
+                    );
+                    
                     double global_residual = 0.0;
 
                     MPI_Allreduce(
@@ -252,7 +252,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if ((step + 1) % 1000 == 0) {
+            if (diagnostics && (step + 1) % 1000 == 0) {
                 const double global_mass = get_global_mass(lbm_grid);
 
                 const double absolute_drift = global_mass - initial_mass;

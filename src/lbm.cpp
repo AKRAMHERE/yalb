@@ -18,6 +18,13 @@ LBM create_lbm(int rows, int cols) {
         9
     );
 
+    grid.f_next = Kokkos::View<double***, Kokkos::LayoutRight>(
+        "f_next",
+        rows,
+        cols,
+        9
+    );
+
     grid.v = Kokkos::View<double***>(
         "v",
         rows,
@@ -31,26 +38,51 @@ LBM create_lbm(int rows, int cols) {
         cols
     );
 
+    const int halo_size = cols * 9; // Each row has cols * 9 distribution functions
+
+    grid.send_lower =
+        Kokkos::View<double*>(
+            "send_lower",
+            halo_size
+        );
+
+    grid.send_upper =
+        Kokkos::View<double*>(
+            "send_upper",
+            halo_size
+        );
+
+    grid.recv_lower =
+        Kokkos::View<double*>(
+            "recv_lower",
+            halo_size
+        );
+
+    grid.recv_upper =
+        Kokkos::View<double*>(
+            "recv_upper",
+            halo_size
+        );
+
+    
+
     return grid;
 }
 
 double compute_local_fluid_mass(const LBM& lbm)
 {
-    auto rho_host = Kokkos::create_mirror_view(lbm.rho);
-    auto wall_host = Kokkos::create_mirror_view(lbm.wall);
-
-    Kokkos::deep_copy(rho_host, lbm.rho);
-    Kokkos::deep_copy(wall_host, lbm.wall);
-
     double local_mass = 0.0;
 
-    for (int row = 1; row < lbm.rows - 1; ++row) {
-        for (int col = 0; col < lbm.cols; ++col) {
-            if (!wall_host(row, col)) {
-                local_mass += rho_host(row, col);
+    Kokkos::parallel_reduce(
+        "FluidMass",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>({1, 0}, {lbm.rows - 1, lbm.cols}),
+        KOKKOS_LAMBDA(int row, int col, double& mass) {
+            if (!lbm.wall(row, col)) {
+                mass += lbm.rho(row, col);
             }
-        }
-    }
+        },
+        local_mass
+    );
 
     return local_mass;
 }
@@ -181,7 +213,6 @@ void stream_lbm(LBM& lbm, double u_lid, int local_start, int global_rows) {
         This matters because not every f_next entry is necessarily written
         during every streaming step, especially near walls.
     */
-    Kokkos::deep_copy(f_next, 0.0);
 
     Kokkos::parallel_for(
         "StreamLBM",
@@ -306,17 +337,13 @@ void stream_lbm(LBM& lbm, double u_lid, int local_start, int global_rows) {
 
 void stream_lbm_pull(LBM& lbm, double u_lid, int local_start, int global_rows) {
 
-    // std::cout << "u_lid = " << u_lid << '\n';
-
-    Kokkos::View<double***, Kokkos::LayoutRight> f_next("f_next", lbm.rows, lbm.cols, 9);
-    
     /*
         Initialize f_next to zero.
 
         This matters because not every f_next entry is necessarily written
         during every streaming step, especially near walls.
     */
-    Kokkos::deep_copy(f_next, 0.0);
+    Kokkos::deep_copy(lbm.f_next, 0.0);
 
     Kokkos::parallel_for(
         "StreamLBM",
@@ -366,7 +393,7 @@ void stream_lbm_pull(LBM& lbm, double u_lid, int local_start, int global_rows) {
                 source_col >= lbm.cols;
 
             if (source_outside) {
-                f_next(row, col, i) = lbm.f(row, col, opposite[i]);
+                lbm.f_next(row, col, i) = lbm.f(row, col, opposite[i]);
                 return;
             }
 
@@ -392,18 +419,20 @@ void stream_lbm_pull(LBM& lbm, double u_lid, int local_start, int global_rows) {
                         dcol[i] *
                         u_lid;
 
-                    f_next(row, col, i) = lbm.f(row, col, opposite[i]) + wall_correction;
+                    lbm.f_next(row, col, i) = lbm.f(row, col, opposite[i]) + wall_correction;
                 } else {
-                    f_next(row, col, i) = lbm.f(row, col, opposite[i]);
+                    lbm.f_next(row, col, i) = lbm.f(row, col, opposite[i]);
                 }
             return;
            }
-           f_next(row, col, i) = lbm.f(source_row, source_col, i);
+           lbm.f_next(row, col, i) = lbm.f(source_row, source_col, i);
         }
     );
 
-    lbm.f = f_next; // Update the distribution functions after streaming
+    std::swap(lbm.f, lbm.f_next); // Update the distribution functions after streaming
+
 }
+
 
 
 void compute_density(LBM& lbm) {
@@ -549,20 +578,93 @@ Kokkos::View<double***, Kokkos::LayoutRight> compute_equilibrium(LBM& lbm) {
     return feq;
 }
 
-void collision_step(LBM& lbm) {
-    double tau = 0.596; // Relaxation time
-    auto feq = compute_equilibrium(lbm);
+void collision_step(LBM& lbm)
+{
+    constexpr double tau = 0.596;
+    constexpr double omega = 1.0 / tau;
 
     Kokkos::parallel_for(
-        "CollisionStep",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>({1, 0, 0}, {lbm.rows - 1, lbm.cols, 9}),
-        KOKKOS_LAMBDA(int x, int y, int i) {
+        "Collision",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+            {1, 0},
+            {lbm.rows - 1, lbm.cols}
+        ),
+        KOKKOS_LAMBDA(int row, int col) {
 
-            if (lbm.wall(x, y)) {
+            if (lbm.wall(row, col)) {
                 return;
             }
 
-            lbm.f(x, y, i) += -(lbm.f(x, y, i) - feq(x, y, i)) / tau;
+            double f[9];
+
+            for (int i = 0; i < 9; ++i) {
+                f[i] = lbm.f(row, col, i);
+            }
+
+            const double rho =
+                f[0] + f[1] + f[2] +
+                f[3] + f[4] + f[5] +
+                f[6] + f[7] + f[8];
+
+            const double ux =
+                (
+                    f[1] - f[3] +
+                    f[5] - f[6] -
+                    f[7] + f[8]
+                ) / rho;
+
+            const double uy =
+                (
+                    f[2] - f[4] +
+                    f[5] + f[6] -
+                    f[7] - f[8]
+                ) / rho;
+
+            const double u2 =
+                ux * ux + uy * uy;
+
+            constexpr double w[9] = {
+                4.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0
+            };
+
+            constexpr int cx[9] =
+                {0,1,0,-1,0,1,-1,-1,1};
+
+            constexpr int cy[9] =
+                {0,0,1,0,-1,1,1,-1,-1};
+
+            for (int i = 0; i < 9; ++i) {
+
+                const double cu =
+                    cx[i] * ux +
+                    cy[i] * uy;
+
+                const double feq =
+                    w[i] *
+                    rho *
+                    (
+                        1.0 +
+                        3.0 * cu +
+                        4.5 * cu * cu -
+                        1.5 * u2
+                    );
+
+                lbm.f(row, col, i) =
+                    f[i] -
+                    omega * (f[i] - feq);
+            }
+
+            lbm.rho(row, col) = rho;
+            lbm.v(row, col, 0) = ux;
+            lbm.v(row, col, 1) = uy;
         }
     );
 }
@@ -701,7 +803,6 @@ void initialize_eq_conditions(LBM& lbm){
         }
     );
     
-
 }
 
 void initialize_shear_wave(LBM &lbm) {
@@ -763,52 +864,40 @@ void exchange_halos(LBM& lbm, int rank, int size) {
     const int values_per_row =
         lbm.cols * 9;
 
-    auto f_host =
-        Kokkos::create_mirror_view_and_copy(
-            Kokkos::HostSpace(),
-            lbm.f
-        );
 
-    std::vector<double> send_lower(values_per_row);
-    std::vector<double> send_upper(values_per_row);
-    std::vector<double> receive_lower(values_per_row);
-    std::vector<double> receive_upper(values_per_row);
+    // Pack boundary directly on the GPU
 
-    /*
-        Pack the first and last owned rows.
+    // Owned rows: 1 ... lbm.rows - 2
+    // Ghost rows: 0 and lbm.rows - 1
 
-        Owned rows:
-            1 ... lbm.rows - 2
+    Kokkos::parallel_for(
+        "PackHalos",
+        Kokkos::RangePolicy<>(0, values_per_row),
+        KOKKOS_LAMBDA(const int idx) {
 
-        Ghost rows:
-            0
-            lbm.rows - 1
-    */
-    for (int col = 0; col < lbm.cols; ++col) {
-        for (int i = 0; i < 9; ++i) {
-            const int index =
-                col * 9 + i;
+            const int col = idx / 9;
+            const int i   = idx % 9;
 
-            send_lower[index] =
-                f_host(1, col, i);
+            lbm.send_lower(idx) =
+                lbm.f(1, col, i);
 
-            send_upper[index] =
-                f_host(lbm.rows - 2, col, i);
+            lbm.send_upper(idx) =
+                lbm.f(lbm.rows - 2, col, i);
         }
-    }
+    );
 
-    /*
-        Send the lower owned row to the lower rank and receive
-        the upper rank's lower owned row into our upper ghost.
-    */
+    Kokkos::fence(); // Ensure packing is complete before MPI communication
+
+    // Send lower owned row downward. Receive upper lower owned row.
+
     MPI_Sendrecv(
-        send_lower.data(),
+        lbm.send_lower.data(),
         values_per_row,
         MPI_DOUBLE,
         lower_rank,
         100,
 
-        receive_upper.data(),
+        lbm.recv_upper.data(),
         values_per_row,
         MPI_DOUBLE,
         upper_rank,
@@ -818,18 +907,16 @@ void exchange_halos(LBM& lbm, int rank, int size) {
         MPI_STATUS_IGNORE
     );
 
-    /*
-        Send the upper owned row to the upper rank and receive
-        the lower rank's upper owned row into our lower ghost.
-    */
+    // Send upper owned row upward. Receive lower upper owned row.
+
     MPI_Sendrecv(
-        send_upper.data(),
+        lbm.send_upper.data(),
         values_per_row,
         MPI_DOUBLE,
         upper_rank,
         200,
 
-        receive_lower.data(),
+        lbm.recv_lower.data(),
         values_per_row,
         MPI_DOUBLE,
         lower_rank,
@@ -839,35 +926,28 @@ void exchange_halos(LBM& lbm, int rank, int size) {
         MPI_STATUS_IGNORE
     );
 
-    if (lower_rank != MPI_PROC_NULL) {
-        for (int col = 0; col < lbm.cols; ++col) {
-            for (int i = 0; i < 9; ++i) {
-                const int index =
-                    col * 9 + i;
+    // Unpack received halos directly on the GPU
 
-                f_host(0, col, i) =
-                    receive_lower[index];
+    Kokkos::parallel_for(
+        "UnpackHalos",
+        Kokkos::RangePolicy<>(0, values_per_row),
+        KOKKOS_LAMBDA(const int idx) {
+
+            const int col = idx / 9;
+            const int i   = idx % 9;
+
+            if (lower_rank != MPI_PROC_NULL) {
+                lbm.f(0, col, i) =
+                    lbm.recv_lower(idx);
+            }
+
+            if (upper_rank != MPI_PROC_NULL) {
+                lbm.f(lbm.rows - 1, col, i) =
+                    lbm.recv_upper(idx);
             }
         }
-    }
-
-    if (upper_rank != MPI_PROC_NULL) {
-        for (int col = 0; col < lbm.cols; ++col) {
-            for (int i = 0; i < 9; ++i) {
-                const int index =
-                    col * 9 + i;
-
-                f_host(
-                    lbm.rows - 1,
-                    col,
-                    i
-                ) = receive_upper[index];
-            }
-        }
-    }
-
-    Kokkos::deep_copy(
-        lbm.f,
-        f_host
     );
+
+    // Ensure unpacking is complete
+    Kokkos::fence();
 }
