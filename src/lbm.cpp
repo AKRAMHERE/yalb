@@ -64,7 +64,21 @@ LBM create_lbm(int rows, int cols) {
             halo_size
         );
 
-    
+    grid.send_lower_host =
+    Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+        "send_lower_host", halo_size);
+
+    grid.send_upper_host =
+        Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+            "send_upper_host", halo_size);
+
+    grid.recv_lower_host =
+        Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+            "recv_lower_host", halo_size);
+
+    grid.recv_upper_host =
+        Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+            "recv_upper_host", halo_size);
 
     return grid;
 }
@@ -851,54 +865,68 @@ void initialize_shear_wave(LBM &lbm) {
 
 void exchange_halos(LBM& lbm, int rank, int size) {
     
+    if (size == 1) {
+        // No need to exchange halos if there's only one rank
+
+        static bool printed = false;
+
+        if (!printed) {
+            std::cout << "Skipping halo exchange for single rank\n";
+            printed = true;
+        }
+        
+        return;
+    }
+
+    exchange_halos_host(lbm, rank, size);
+
+}
+
+void exchange_halos_host(LBM& lbm, int rank, int size)
+{
     const int lower_rank =
-        (rank == 0)
-            ? MPI_PROC_NULL
-            : rank - 1;
+        (rank == 0) ? MPI_PROC_NULL : rank - 1;
 
     const int upper_rank =
-        (rank == size - 1)
-            ? MPI_PROC_NULL
-            : rank + 1;
+        (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
 
-    const int values_per_row =
-        lbm.cols * 9;
-
-
-    // Pack boundary directly on the GPU
-
-    // Owned rows: 1 ... lbm.rows - 2
-    // Ghost rows: 0 and lbm.rows - 1
+    const int n = lbm.cols * 9;
 
     Kokkos::parallel_for(
         "PackHalos",
-        Kokkos::RangePolicy<>(0, values_per_row),
-        KOKKOS_LAMBDA(const int idx) {
-
+        Kokkos::RangePolicy<>(0, n),
+        KOKKOS_LAMBDA(int idx) {
             const int col = idx / 9;
             const int i   = idx % 9;
 
-            lbm.send_lower(idx) =
-                lbm.f(1, col, i);
-
-            lbm.send_upper(idx) =
-                lbm.f(lbm.rows - 2, col, i);
+            lbm.send_lower(idx) = lbm.f(1, col, i);
+            lbm.send_upper(idx) = lbm.f(lbm.rows - 2, col, i);
         }
     );
 
-    Kokkos::fence(); // Ensure packing is complete before MPI communication
+    if (lower_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.send_lower_host,
+            lbm.send_lower
+        );
+    }
 
-    // Send lower owned row downward. Receive upper lower owned row.
+    if (upper_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.send_upper_host,
+            lbm.send_upper
+        );
+    }
 
     MPI_Sendrecv(
-        lbm.send_lower.data(),
-        values_per_row,
+        lbm.send_lower_host.data(),
+        n,
         MPI_DOUBLE,
         lower_rank,
         100,
 
-        lbm.recv_upper.data(),
-        values_per_row,
+        lbm.recv_upper_host.data(),
+        n,
         MPI_DOUBLE,
         upper_rank,
         100,
@@ -907,17 +935,15 @@ void exchange_halos(LBM& lbm, int rank, int size) {
         MPI_STATUS_IGNORE
     );
 
-    // Send upper owned row upward. Receive lower upper owned row.
-
     MPI_Sendrecv(
-        lbm.send_upper.data(),
-        values_per_row,
+        lbm.send_upper_host.data(),
+        n,
         MPI_DOUBLE,
         upper_rank,
         200,
 
-        lbm.recv_lower.data(),
-        values_per_row,
+        lbm.recv_lower_host.data(),
+        n,
         MPI_DOUBLE,
         lower_rank,
         200,
@@ -926,13 +952,24 @@ void exchange_halos(LBM& lbm, int rank, int size) {
         MPI_STATUS_IGNORE
     );
 
-    // Unpack received halos directly on the GPU
+    if (lower_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.recv_lower,
+            lbm.recv_lower_host
+        );
+    }
+
+    if (upper_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.recv_upper,
+            lbm.recv_upper_host
+        );
+    }
 
     Kokkos::parallel_for(
         "UnpackHalos",
-        Kokkos::RangePolicy<>(0, values_per_row),
-        KOKKOS_LAMBDA(const int idx) {
-
+        Kokkos::RangePolicy<>(0, n),
+        KOKKOS_LAMBDA(int idx) {
             const int col = idx / 9;
             const int i   = idx % 9;
 
@@ -947,7 +984,4 @@ void exchange_halos(LBM& lbm, int rank, int size) {
             }
         }
     );
-
-    // Ensure unpacking is complete
-    Kokkos::fence();
 }
