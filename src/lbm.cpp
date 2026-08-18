@@ -884,40 +884,49 @@ void exchange_halos(LBM& lbm, int rank, int size) {
 
 void exchange_halos_host(LBM& lbm, int rank, int size)
 {
-    if (size == 1)
-        return;
-
     const int lower_rank =
-        rank == 0 ? MPI_PROC_NULL : rank - 1;
+        (rank == 0) ? MPI_PROC_NULL : rank - 1;
 
     const int upper_rank =
-        rank == size - 1 ? MPI_PROC_NULL : rank + 1;
+        (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
 
-    const int row_size = lbm.cols * 9;
+    const int n = lbm.cols * 9;
 
-    double* base = lbm.f.data();
+    Kokkos::parallel_for(
+        "PackHalos",
+        Kokkos::RangePolicy<>(0, n),
+        KOKKOS_LAMBDA(int idx) {
+            const int col = idx / 9;
+            const int i   = idx % 9;
 
-    double* lower_send =
-        base + 1 * row_size;
+            lbm.send_lower(idx) = lbm.f(1, col, i);
+            lbm.send_upper(idx) = lbm.f(lbm.rows - 2, col, i);
+        }
+    );
 
-    double* upper_send =
-        base + (lbm.rows - 2) * row_size;
+    if (lower_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.send_lower_host,
+            lbm.send_lower
+        );
+    }
 
-    double* lower_recv =
-        base + 0 * row_size;
-
-    double* upper_recv =
-        base + (lbm.rows - 1) * row_size;
+    if (upper_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.send_upper_host,
+            lbm.send_upper
+        );
+    }
 
     MPI_Sendrecv(
-        lower_send,
-        row_size,
+        lbm.send_lower_host.data(),
+        n,
         MPI_DOUBLE,
         lower_rank,
         100,
 
-        upper_recv,
-        row_size,
+        lbm.recv_upper_host.data(),
+        n,
         MPI_DOUBLE,
         upper_rank,
         100,
@@ -927,19 +936,52 @@ void exchange_halos_host(LBM& lbm, int rank, int size)
     );
 
     MPI_Sendrecv(
-        upper_send,
-        row_size,
+        lbm.send_upper_host.data(),
+        n,
         MPI_DOUBLE,
         upper_rank,
         200,
 
-        lower_recv,
-        row_size,
+        lbm.recv_lower_host.data(),
+        n,
         MPI_DOUBLE,
         lower_rank,
         200,
 
         MPI_COMM_WORLD,
         MPI_STATUS_IGNORE
+    );
+
+    if (lower_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.recv_lower,
+            lbm.recv_lower_host
+        );
+    }
+
+    if (upper_rank != MPI_PROC_NULL) {
+        Kokkos::deep_copy(
+            lbm.recv_upper,
+            lbm.recv_upper_host
+        );
+    }
+
+    Kokkos::parallel_for(
+        "UnpackHalos",
+        Kokkos::RangePolicy<>(0, n),
+        KOKKOS_LAMBDA(int idx) {
+            const int col = idx / 9;
+            const int i   = idx % 9;
+
+            if (lower_rank != MPI_PROC_NULL) {
+                lbm.f(0, col, i) =
+                    lbm.recv_lower(idx);
+            }
+
+            if (upper_rank != MPI_PROC_NULL) {
+                lbm.f(lbm.rows - 1, col, i) =
+                    lbm.recv_upper(idx);
+            }
+        }
     );
 }
