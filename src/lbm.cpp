@@ -884,49 +884,40 @@ void exchange_halos(LBM& lbm, int rank, int size) {
 
 void exchange_halos_host(LBM& lbm, int rank, int size)
 {
+    if (size == 1)
+        return;
+
     const int lower_rank =
-        (rank == 0) ? MPI_PROC_NULL : rank - 1;
+        rank == 0 ? MPI_PROC_NULL : rank - 1;
 
     const int upper_rank =
-        (rank == size - 1) ? MPI_PROC_NULL : rank + 1;
+        rank == size - 1 ? MPI_PROC_NULL : rank + 1;
 
-    const int n = lbm.cols * 9;
+    const int row_size = lbm.cols * 9;
 
-    Kokkos::parallel_for(
-        "PackHalos",
-        Kokkos::RangePolicy<>(0, n),
-        KOKKOS_LAMBDA(int idx) {
-            const int col = idx / 9;
-            const int i   = idx % 9;
+    double* base = lbm.f.data();
 
-            lbm.send_lower(idx) = lbm.f(1, col, i);
-            lbm.send_upper(idx) = lbm.f(lbm.rows - 2, col, i);
-        }
-    );
+    double* lower_send =
+        base + 1 * row_size;
 
-    if (lower_rank != MPI_PROC_NULL) {
-        Kokkos::deep_copy(
-            lbm.send_lower_host,
-            lbm.send_lower
-        );
-    }
+    double* upper_send =
+        base + (lbm.rows - 2) * row_size;
 
-    if (upper_rank != MPI_PROC_NULL) {
-        Kokkos::deep_copy(
-            lbm.send_upper_host,
-            lbm.send_upper
-        );
-    }
+    double* lower_recv =
+        base + 0 * row_size;
+
+    double* upper_recv =
+        base + (lbm.rows - 1) * row_size;
 
     MPI_Sendrecv(
-        lbm.send_lower_host.data(),
-        n,
+        lower_send,
+        row_size,
         MPI_DOUBLE,
         lower_rank,
         100,
 
-        lbm.recv_upper_host.data(),
-        n,
+        upper_recv,
+        row_size,
         MPI_DOUBLE,
         upper_rank,
         100,
@@ -936,52 +927,19 @@ void exchange_halos_host(LBM& lbm, int rank, int size)
     );
 
     MPI_Sendrecv(
-        lbm.send_upper_host.data(),
-        n,
+        upper_send,
+        row_size,
         MPI_DOUBLE,
         upper_rank,
         200,
 
-        lbm.recv_lower_host.data(),
-        n,
+        lower_recv,
+        row_size,
         MPI_DOUBLE,
         lower_rank,
         200,
 
         MPI_COMM_WORLD,
         MPI_STATUS_IGNORE
-    );
-
-    if (lower_rank != MPI_PROC_NULL) {
-        Kokkos::deep_copy(
-            lbm.recv_lower,
-            lbm.recv_lower_host
-        );
-    }
-
-    if (upper_rank != MPI_PROC_NULL) {
-        Kokkos::deep_copy(
-            lbm.recv_upper,
-            lbm.recv_upper_host
-        );
-    }
-
-    Kokkos::parallel_for(
-        "UnpackHalos",
-        Kokkos::RangePolicy<>(0, n),
-        KOKKOS_LAMBDA(int idx) {
-            const int col = idx / 9;
-            const int i   = idx % 9;
-
-            if (lower_rank != MPI_PROC_NULL) {
-                lbm.f(0, col, i) =
-                    lbm.recv_lower(idx);
-            }
-
-            if (upper_rank != MPI_PROC_NULL) {
-                lbm.f(lbm.rows - 1, col, i) =
-                    lbm.recv_upper(idx);
-            }
-        }
     );
 }

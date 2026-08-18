@@ -129,6 +129,8 @@ int main(int argc, char *argv[]) {
             
             collision_step(lbm_grid);
 
+            Kokkos::fence(); // Ensure all Kokkos operations are complete before halo exchange
+
             exchange_halos(
                 lbm_grid,
                 rank,
