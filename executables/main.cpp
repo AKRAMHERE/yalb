@@ -111,7 +111,7 @@ int main(int argc, char *argv[]) {
 
         const int residual_interval = 100;
         const double residual_tolerance = 1.0e-8;
-        const int num_steps = 100000;
+        const int num_steps = 10000;
 
         Kokkos::fence(); // Ensure all Kokkos operations are complete before starting the timer
 
