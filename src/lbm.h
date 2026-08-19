@@ -48,3 +48,4 @@ void exchange_halos(LBM& lbm, int rank, int size);
 void exchange_halos_host(LBM& lbm, int rank, int size);
 void stream_lbm_pull(LBM& lbm, double u_lid, int local_start, int global_rows);
 double compute_local_fluid_mass(const LBM& lbm);
+void collision_and_stream(LBM& lbm, double u_lid, int local_start, int global_rows);

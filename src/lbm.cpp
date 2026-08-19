@@ -357,7 +357,7 @@ void stream_lbm_pull(LBM& lbm, double u_lid, int local_start, int global_rows) {
         This matters because not every f_next entry is necessarily written
         during every streaming step, especially near walls.
     */
-    Kokkos::deep_copy(lbm.f_next, 0.0);
+    // Kokkos::deep_copy(lbm.f_next, 0.0);
 
     Kokkos::parallel_for(
         "StreamLBM",
@@ -592,96 +592,6 @@ Kokkos::View<double***, Kokkos::LayoutRight> compute_equilibrium(LBM& lbm) {
     return feq;
 }
 
-void collision_step(LBM& lbm)
-{
-    constexpr double tau = 0.596;
-    constexpr double omega = 1.0 / tau;
-
-    Kokkos::parallel_for(
-        "Collision",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-            {1, 0},
-            {lbm.rows - 1, lbm.cols}
-        ),
-        KOKKOS_LAMBDA(int row, int col) {
-
-            if (lbm.wall(row, col)) {
-                return;
-            }
-
-            double f[9];
-
-            for (int i = 0; i < 9; ++i) {
-                f[i] = lbm.f(row, col, i);
-            }
-
-            const double rho =
-                f[0] + f[1] + f[2] +
-                f[3] + f[4] + f[5] +
-                f[6] + f[7] + f[8];
-
-            const double ux =
-                (
-                    f[1] - f[3] +
-                    f[5] - f[6] -
-                    f[7] + f[8]
-                ) / rho;
-
-            const double uy =
-                (
-                    f[2] - f[4] +
-                    f[5] + f[6] -
-                    f[7] - f[8]
-                ) / rho;
-
-            const double u2 =
-                ux * ux + uy * uy;
-
-            constexpr double w[9] = {
-                4.0 / 9.0,
-                1.0 / 9.0,
-                1.0 / 9.0,
-                1.0 / 9.0,
-                1.0 / 9.0,
-                1.0 / 36.0,
-                1.0 / 36.0,
-                1.0 / 36.0,
-                1.0 / 36.0
-            };
-
-            constexpr int cx[9] =
-                {0,1,0,-1,0,1,-1,-1,1};
-
-            constexpr int cy[9] =
-                {0,0,1,0,-1,1,1,-1,-1};
-
-            for (int i = 0; i < 9; ++i) {
-
-                const double cu =
-                    cx[i] * ux +
-                    cy[i] * uy;
-
-                const double feq =
-                    w[i] *
-                    rho *
-                    (
-                        1.0 +
-                        3.0 * cu +
-                        4.5 * cu * cu -
-                        1.5 * u2
-                    );
-
-                lbm.f(row, col, i) =
-                    f[i] -
-                    omega * (f[i] - feq);
-            }
-
-            lbm.rho(row, col) = rho;
-            lbm.v(row, col, 0) = ux;
-            lbm.v(row, col, 1) = uy;
-        }
-    );
-}
 
 void initialize_density_bump(LBM& lbm) {
     /*
@@ -984,4 +894,179 @@ void exchange_halos_host(LBM& lbm, int rank, int size)
             }
         }
     );
+}
+
+void collision_and_stream(
+    LBM& lbm,
+    double u_lid,
+    int local_start,
+    int global_rows)
+{
+    constexpr double tau = 0.596;
+    constexpr double omega = 1.0 / tau;
+
+    Kokkos::parallel_for(
+        "CollisionAndStream",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+            {1, 0},
+            {lbm.rows - 1, lbm.cols}
+        ),
+        KOKKOS_LAMBDA(int row, int col) {
+
+            if (lbm.wall(row, col)) {
+                return;
+            }
+
+            constexpr double w[9] = {
+                4.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 9.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0,
+                1.0 / 36.0
+            };
+
+            constexpr int cx[9] =
+                {0, 1, 0, -1, 0, 1, -1, -1, 1};
+
+            constexpr int cy[9] =
+                {0, 0, 1, 0, -1, 1, 1, -1, -1};
+
+            constexpr int opposite[9] =
+                {0, 3, 4, 1, 2, 7, 8, 5, 6};
+
+            double f[9];
+
+            // -----------------------------------------
+            // PULL STREAM
+            // -----------------------------------------
+
+            for (int i = 0; i < 9; ++i) {
+
+                const int src_row = row - cx[i];
+                const int src_col = col - cy[i];
+
+                const bool source_outside =
+                    src_row < 0 ||
+                    src_row >= lbm.rows ||
+                    src_col < 0 ||
+                    src_col >= lbm.cols;
+
+                // Outside the local domain:
+                // ordinary bounce-back
+                if (source_outside) {
+                    f[i] = lbm.f(row, col, opposite[i]);
+                    continue;
+                }
+
+                // Source is a physical wall
+                if (lbm.wall(src_row, src_col)) {
+
+                    // Convert this rank's local row to the corresponding
+                    // row in the complete global grid.
+                    const int src_global_row =
+                        local_start + src_row - 1;
+
+                    // Is this wall the moving top lid?
+                    //
+                    // Exclude the left/right corner nodes.
+                    const bool hits_moving_lid =
+                        src_global_row == global_rows - 1 &&
+                        col > 0 &&
+                        col < lbm.cols - 1;
+
+                    if (hits_moving_lid) {
+
+                        const double rho_wall =
+                            lbm.rho(row, col);
+
+                        const double wall_correction =
+                            6.0 *
+                            w[i] *
+                            rho_wall *
+                            cy[i] *
+                            u_lid;
+
+                        f[i] =
+                            lbm.f(row, col, opposite[i]) +
+                            wall_correction;
+
+                    } else {
+
+                        // Stationary wall
+                        f[i] =
+                            lbm.f(row, col, opposite[i]);
+                    }
+
+                    continue;
+                }
+
+                // Normal fluid source
+                f[i] =
+                    lbm.f(src_row, src_col, i);
+            }
+
+            // -----------------------------------------
+            // MACROSCOPIC QUANTITIES
+            // -----------------------------------------
+
+            const double rho =
+                f[0] + f[1] + f[2] +
+                f[3] + f[4] + f[5] +
+                f[6] + f[7] + f[8];
+
+            const double ux =
+                (
+                    f[1] - f[3] +
+                    f[5] - f[6] -
+                    f[7] + f[8]
+                ) / rho;
+
+            const double uy =
+                (
+                    f[2] - f[4] +
+                    f[5] + f[6] -
+                    f[7] - f[8]
+                ) / rho;
+
+            const double u2 =
+                ux * ux + uy * uy;
+
+            // -----------------------------------------
+            // COLLISION + WRITE DIRECTLY TO f_next
+            // -----------------------------------------
+
+            for (int i = 0; i < 9; ++i) {
+
+                const double cu =
+                    cx[i] * ux +
+                    cy[i] * uy;
+
+                const double feq =
+                    w[i] *
+                    rho *
+                    (
+                        1.0 +
+                        3.0 * cu +
+                        4.5 * cu * cu -
+                        1.5 * u2
+                    );
+
+                lbm.f_next(row, col, i) =
+                    f[i] -
+                    omega * (f[i] - feq);
+            }
+
+            lbm.rho(row, col) = rho;
+            lbm.v(row, col, 0) = ux;
+            lbm.v(row, col, 1) = uy;
+        }
+    );
+
+    Kokkos::fence();
+
+    std::swap(lbm.f, lbm.f_next);
 }

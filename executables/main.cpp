@@ -23,11 +23,14 @@ int main(int argc, char *argv[]) {
 
         int global_rows = 129;
         int global_cols = 129;
+        int num_steps = 10000;
 
-        if (argc >= 3) {
+        if (argc >= 4) {
             global_rows = std::stoi(argv[1]);
             global_cols = std::stoi(argv[2]);
             std::cout << "Using grid size: " << global_rows << "x" << global_cols << "\n";
+            num_steps = std::stoi(argv[3]);
+            std::cout << "Using number of steps: " << num_steps << "\n";
         } else if (rank == 0) {
             std::cout << "Using default grid size: " << global_rows << "x" << global_cols << "\n";
             std::cout << "To specify grid size, run as: ./executable <rows> <cols>\n";
@@ -111,7 +114,7 @@ int main(int argc, char *argv[]) {
 
         const int residual_interval = 100;
         const double residual_tolerance = 1.0e-8;
-        const int num_steps = 10000;
+        // const int num_steps = 10000;
 
         Kokkos::fence(); // Ensure all Kokkos operations are complete before starting the timer
 
@@ -127,9 +130,9 @@ int main(int argc, char *argv[]) {
             // compute_density(lbm_grid);
             // compute_velocity(lbm_grid);
             
-            collision_step(lbm_grid);
+            // collision_step(lbm_grid);
 
-            Kokkos::fence(); // Ensure all Kokkos operations are complete before halo exchange
+            // Kokkos::fence(); // Ensure all Kokkos operations are complete before halo exchange
 
             exchange_halos(
                 lbm_grid,
@@ -137,7 +140,16 @@ int main(int argc, char *argv[]) {
                 size
             );
 
+            /*
             stream_lbm_pull(
+                lbm_grid,
+                0.1,
+                local_start,
+                global_rows
+            );
+            */
+
+            collision_and_stream(
                 lbm_grid,
                 0.1,
                 local_start,
