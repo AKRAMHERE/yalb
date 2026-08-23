@@ -65,19 +65,19 @@ LBM create_lbm(int rows, int cols) {
         );
 
     grid.send_lower_host =
-    Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+    Kokkos::View<double*, HostPinnedSpace>(
         "send_lower_host", halo_size);
 
     grid.send_upper_host =
-        Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+        Kokkos::View<double*, HostPinnedSpace>(
             "send_upper_host", halo_size);
 
     grid.recv_lower_host =
-        Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+        Kokkos::View<double*, HostPinnedSpace>(
             "recv_lower_host", halo_size);
 
     grid.recv_upper_host =
-        Kokkos::View<double*, Kokkos::CudaHostPinnedSpace>(
+        Kokkos::View<double*, HostPinnedSpace>(
             "recv_upper_host", halo_size);
 
     return grid;

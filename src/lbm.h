@@ -2,6 +2,17 @@
 
 #include <Kokkos_Core.hpp>
 
+// Host-pinned memory space used to stage MPI halo buffers for fast
+// device<->host transfers. Kokkos::CudaHostPinnedSpace only exists when
+// Kokkos is built with CUDA enabled (e.g. on bwUniCluster's A100 nodes);
+// falling back to plain HostSpace keeps the code buildable on CPU-only
+// machines (local dev, CI) without changing GPU-build behavior.
+#if defined(KOKKOS_ENABLE_CUDA)
+using HostPinnedSpace = Kokkos::CudaHostPinnedSpace;
+#else
+using HostPinnedSpace = Kokkos::HostSpace;
+#endif
+
 struct LBM {
     Kokkos::View<double**> rho;
     Kokkos::View<double***, Kokkos::LayoutRight> f;
@@ -18,10 +29,10 @@ struct LBM {
     Kokkos::View<double*> recv_lower;
     Kokkos::View<double*> recv_upper;
 
-    Kokkos::View<double*, Kokkos::CudaHostPinnedSpace> send_lower_host;
-    Kokkos::View<double*, Kokkos::CudaHostPinnedSpace> send_upper_host;
-    Kokkos::View<double*, Kokkos::CudaHostPinnedSpace> recv_lower_host;
-    Kokkos::View<double*, Kokkos::CudaHostPinnedSpace> recv_upper_host;
+    Kokkos::View<double*, HostPinnedSpace> send_lower_host;
+    Kokkos::View<double*, HostPinnedSpace> send_upper_host;
+    Kokkos::View<double*, HostPinnedSpace> recv_lower_host;
+    Kokkos::View<double*, HostPinnedSpace> recv_upper_host;
 
   // LBM(int rows, int cols) : rho("rho", rows, cols), f("f", rows, cols, 9), v("v", rows, cols) {}
 };
